@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Gerador de Rotas de Ônibus v2</title>
+<!-- CSS do Leaflet: necessário só para o mapa renderizar; não há CSS próprio -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+</head>
+<body>
+<h3>Gerador de Rotas de Ônibus</h3>
+<table width="100%">
+<tr>
+<td width="360" valign="top">
+  Partida:<br>
+  <input id="origem" size="44" placeholder="Ex.: Av. Paulista, 1000, São Paulo"><br><br>
+  Chegada:<br>
+  <input id="destino" size="44" placeholder="Ex.: Terminal Santo Amaro, São Paulo"><br><br>
+  Servidor Valhalla (troque por http://localhost:8002 se rodar o seu):<br>
+  <input id="servidor" size="44" value="https://valhalla1.openstreetmap.de"><br><br>
+  <button id="gerar" onclick="gerar()">Gerar rotas</button>
+  <p id="status"></p>
+  <p id="veredito"></p>
+  <h4>Rotas ATUAIS (linhas existentes, tracejadas em azul)</h4>
+  <ol id="atuais"></ol>
+  <h4>Rotas CRIADAS (novas, linhas sólidas coloridas)</h4>
+  <ol id="novas"></ol>
+</td>
+<td valign="top">
+  <div id="map" style="height:650px"></div>
+</td>
+</tr>
+</table>
+
+<script>
+const $ = id => document.getElementById(id);
+const map = L.map('map').setView([-23.55, -46.63], 12);
+L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+  maxZoom: 19, attribution: 'Imagens &copy; Esri, Maxar, Earthstar Geographics'
+}).addTo(map);
+const camadas = L.layerGroup().addTo(map);
+
+const COR_ATUAL = ['#2979ff', '#00b0ff', '#7c4dff', '#18ffff', '#448aff', '#536dfe'];
+const COR_NOVA = ['#00e000', '#ff9800', '#e040fb', '#ffeb3b', '#ff5252'];
+const NOME_NOVA = ['verde', 'laranja', 'rosa', 'amarela', 'vermelha'];
+
+let costing = 'bus';
+
+/* ---------- utilidades geográficas ---------- */
+function d(p, q) { // distância em metros (aprox. equirretangular)
+  const x = (q[1] - p[1]) * Math.cos((p[0] + q[0]) * Math.PI / 360) * 111320;
+  const y = (q[0] - p[0]) * 110540;
+  return Math.hypot(x, y);
+}
+function comprimento(path) { let s = 0; for (let i = 1; i < path.length; i++) s += d(path[i - 1], path[i]); return s; }
+function densificar(path, passo) {
+  const out = [];
+  for (let i = 1; i < path.length; i++) {
+    const a = path[i - 1], b = path[i], n = Math.max(1, Math.ceil(d(a, b) / passo));
+    for (let k = 0; k < n; k++) out.push([a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n]);
+  }
+  if (path.length) out.push(path[path.length - 1]);
+  return out;
+}
+function proximo(path, p) {
+  let bi = 0, bd = Infinity;
+  path.forEach((q, i) => { const x = d(q, p); if (x < bd) { bd = x; bi = i; } });
+  return [bi, bd];
+}
+function decodificar(s) { // polyline precisão 6 (Valhalla)
+  let i = 0, lat = 0, lng = 0; const out = [];
+  while (i < s.length) {
+    let b, sh = 0, r = 0;
+    do { b = s.charCodeAt(i++) - 63; r |= (b & 31) << sh; sh += 5; } while (b >= 32);
+    lat += (r & 1) ? ~(r >> 1) : (r >> 1);
+    sh = 0; r = 0;
+    do { b = s.charCodeAt(i++) - 63; r |= (b & 31) << sh; sh += 5; } while (b >= 32);
+    lng += (r & 1) ? ~(r >> 1) : (r >> 1);
+    out.push([lat / 1e6, lng / 1e6]);
+  }
+  return out;
+}
+// fração de pontos de 'path' a até 60 m de algum ponto da referência
+function sobreposicao(path, ref) {
+  if (!ref.length) return 0;
+  const pts = densificar(path, 50); let ok = 0;
+  for (const p of pts) {
+    for (const q of ref) {
+      if (Math.abs(p[0] - q[0]) < 0.001 && Math.abs(p[1] - q[1]) < 0.001 && d(p, q) <= 60) { ok++; break; }
+    }
+  }
+  return ok / pts.length;
+}
+
+/* ---------- geocodificação ---------- */
+async function geocodificar(q) {
+  const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=br&q=' + encodeURIComponent(q);
+  const r = await (await fetch(url)).json();
+  if (!r.length) throw new Error('Endereço não encontrado: ' + q);
+  return [parseFloat(r[0].lat), parseFloat(r[0].lon)];
+}
+
+/* ---------- Valhalla (rotas NOVAS, perfil ônibus) ---------- */
+async function valhalla(endpoint, body) {
+  const base = $('servidor').value.replace(/\/$/, '');
+  const r = await fetch(base + '/' + endpoint, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  return j;
+}
+async function rotear(pontos, alternativas) {
+  const body = {
+    locations: pontos.map((p, i) => ({ lat: p[0], lon: p[1], type: (i === 0 || i === pontos.length - 1) ? 'break' : 'through' })),
+    costing, directions_options: { units: 'kilometers' }
+  };
+  if (alternativas) body.alternates = alternativas;
+  const j = await valhalla('route', body);
+  return [j.trip, ...(j.alternates || []).map(a => a.trip)].map(t => ({
+    path: [].concat(...t.legs.map(l => decodificar(l.shape))),
+    tempo: t.summary.time, km: t.summary.length
+  }));
+}
+function desvio(a, b, t, f) { // ponto intermediário deslocado lateralmente
+  const dx = b[1] - a[1], dy = b[0] - a[0];
+  return [a[0] + dy * t + dx * f, a[1] + dx * t - dy * f];
+}
+
+/* ---------- Overpass (linhas de ônibus EXISTENTES no OpenStreetMap) ---------- */
+function montarCaminho(rel) {
+  const vias = (rel.members || []).filter(m => m.type === 'way' && m.geometry && m.geometry.length > 1)
+    .map(m => m.geometry.map(g => [g.lat, g.lon]));
+  if (!vias.length) return [];
+  if (vias.length > 1) { // orienta a primeira via em direção à segunda
+    const f = vias[0], s = vias[1];
+    const dIni = Math.min(d(f[0], s[0]), d(f[0], s[s.length - 1]));
+    const dFim = Math.min(d(f[f.length - 1], s[0]), d(f[f.length - 1], s[s.length - 1]));
+    if (dIni < dFim) vias[0].reverse();
+  }
+  let path = [];
+  for (const pts of vias) {
+    if (path.length) {
+      const ult = path[path.length - 1];
+      if (d(ult, pts[pts.length - 1]) < d(ult, pts[0])) pts.reverse();
+    }
+    path = path.concat(pts);
+  }
+  return path;
+}
+async function buscarExistentes(a, b) {
+  const R = 250;
+  const q = `[out:json][timeout:30];` +
+    `way(around:${R},${a[0]},${a[1]})[highway]->.wa;rel(bw.wa)[route=bus]->.ra;` +
+    `way(around:${R},${b[0]},${b[1]})[highway]->.wb;rel(bw.wb)[route=bus]->.rb;` +
+    `rel.ra.rb->.ok;.ok out geom;`;
+  const r = await fetch('https://overpass-api.de/api/interpreter', {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'data=' + encodeURIComponent(q)
+  });
+  const j = await r.json();
+  const vistos = new Set(), out = [];
+  for (const rel of j.elements || []) {
+    const cam = montarCaminho(rel); if (cam.length < 2) continue;
+    const [ia, da] = proximo(cam, a), [ib, db] = proximo(cam, b);
+    if (da > 300 || db > 300 || ia >= ib) continue; // não atende A→B nesse sentido
+    const trecho = cam.slice(ia, ib + 1);
+    const km = comprimento(trecho) / 1000;
+    const ref = (rel.tags && rel.tags.ref) || '?';
+    const k = ref + '|' + Math.round(km * 5);
+    if (vistos.has(k)) continue; vistos.add(k);
+    out.push({ nome: ref + (rel.tags && rel.tags.name ? ' – ' + rel.tags.name : ''), path: trecho, km, tempo: null });
+  }
+  return out.sort((x, y) => x.km - y.km).slice(0, 6);
+}
+// tempo da linha existente: mesmo motor e perfil usados nas rotas novas (comparação justa)
+async function tempoExistente(path) {
+  const pts = densificar(path, 50).slice(0, 1500).map(p => ({ lat: p[0], lon: p[1] }));
+  const j = await valhalla('trace_route', {
+    shape: pts, costing, shape_match: 'map_snap',
+    trace_options: { search_radius: 50, gps_accuracy: 20 }, directions_options: { units: 'kilometers' }
+  });
+  return j.trip.summary.time;
+}
+
+/* ---------- fluxo principal ---------- */
+const min = s => (s / 60).toFixed(1) + ' min';
+
+async function gerar() {
+  $('gerar').disabled = true; costing = 'bus';
+  ['atuais', 'novas'].forEach(i => $(i).innerHTML = ''); $('veredito').textContent = '';
+  camadas.clearLayers();
+  let aviso = '';
+  try {
+    $('status').textContent = 'Localizando endereços...';
+    const a = await geocodificar($('origem').value), b = await geocodificar($('destino').value);
+
+    $('status').textContent = 'Buscando linhas de ônibus existentes (OpenStreetMap)...';
+    const existentes = await buscarExistentes(a, b).catch(e => { aviso += ' Falha ao buscar linhas existentes: ' + e.message + '.'; return []; });
+
+    $('status').textContent = 'Gerando rotas novas com perfil de ônibus...';
+    let cands;
+    try { cands = await rotear([a, b], 2); }
+    catch (e) {
+      if (costing !== 'bus') throw e;
+      costing = 'auto'; aviso += ' Servidor sem perfil "bus" (' + e.message + '); usando "auto" (carro).';
+      cands = await rotear([a, b], 2);
+    }
+    const extras = await Promise.all([-0.25, -0.12, 0.12, 0.25].map(f =>
+      rotear([a, desvio(a, b, 0.5, f), b], 0).catch(() => [])));
+    cands = cands.concat(...extras);
+
+    // remove duplicatas e desvios exagerados
+    const menorKm = Math.min(...cands.map(r => r.km)), vistos = new Set();
+    cands = cands.filter(r => {
+      if (r.km > menorKm * 1.6) return false;
+      const k = Math.round(r.km * 10) + '-' + Math.round(r.tempo / 15);
+      if (vistos.has(k)) return false; vistos.add(k); return true;
+    });
+
+    // tempo das linhas existentes
+    $('status').textContent = 'Calculando tempo das linhas existentes...';
+    await Promise.all(existentes.map(async e => { e.tempo = await tempoExistente(e.path).catch(() => null); }));
+
+    // classifica: coincide com linha existente (>= 85%) ou é CRIADA
+    const refDens = [].concat(...existentes.map(e => densificar(e.path, 30)));
+    let coincidem = 0;
+    let novas = [];
+    for (const c of cands) {
+      const ov = sobreposicao(c.path, refDens);
+      if (ov >= 0.85) { coincidem++; continue; }
+      c.inedita = 1 - ov; novas.push(c);
+    }
+    novas.sort((x, y) => x.tempo - y.tempo);
+    novas = novas.slice(0, COR_NOVA.length);
+
+    // desenha
+    const lim = L.latLngBounds([a, b]);
+    existentes.forEach((e, i) => {
+      const l = L.polyline(e.path, { color: COR_ATUAL[i % COR_ATUAL.length], weight: 5, dashArray: '10,8', opacity: 0.95 }).addTo(camadas);
+      l.bindPopup('Linha existente: ' + e.nome); lim.extend(l.getBounds());
+      const li = document.createElement('li');
+      li.textContent = e.nome + ' — ' + e.km.toFixed(1) + ' km, ' + (e.tempo ? min(e.tempo) : 'tempo n/d');
+      $('atuais').appendChild(li);
+    });
+    novas.slice().reverse().forEach((c, k) => {
+      const i = novas.length - 1 - k;
+      const l = L.polyline(c.path, { color: COR_NOVA[i], weight: i === 0 ? 7 : 4, opacity: 0.95 }).addTo(camadas);
+      l.bindPopup('Rota criada ' + NOME_NOVA[i]); lim.extend(l.getBounds());
+    });
+    L.marker(a).addTo(camadas).bindPopup('Partida');
+    L.marker(b).addTo(camadas).bindPopup('Chegada');
+    map.fitBounds(lim, { padding: [30, 30] });
+
+    const tAtual = existentes.map(e => e.tempo).filter(Boolean);
+    const melhorAtual = tAtual.length ? Math.min(...tAtual) : null;
+    novas.forEach((c, i) => {
+      const li = document.createElement('li');
+      let t = NOME_NOVA[i] + ': ' + min(c.tempo) + ', ' + c.km.toFixed(1) + ' km, ' + Math.round(c.inedita * 100) + '% de trajeto inédito';
+      if (melhorAtual) { const dif = melhorAtual - c.tempo; t += dif > 0 ? ' (' + min(dif) + ' mais rápida que a melhor linha atual)' : ' (' + min(-dif) + ' mais lenta que a melhor linha atual)'; }
+      li.textContent = t; $('novas').appendChild(li);
+    });
+
+    if (!existentes.length) $('atuais').innerHTML = '<li>Nenhuma linha existente encontrada no OSM ligando os dois pontos.</li>';
+    if (!novas.length) $('novas').innerHTML = '<li>Nenhuma rota nova distinta das linhas atuais foi encontrada.</li>';
+    if (melhorAtual && novas.length) {
+      const g = melhorAtual - novas[0].tempo;
+      $('veredito').textContent = g > 0
+        ? 'Melhor rota criada: ' + min(g) + ' mais rápida que a melhor linha atual (' + Math.round(g / melhorAtual * 100) + '%).'
+        : 'Nenhuma rota criada superou a melhor linha atual neste trajeto.';
+    }
+    $('status').textContent = 'Perfil usado: ' + costing + '. ' + coincidem + ' candidata(s) coincidiam com linhas existentes e foram descartadas.' + aviso;
+  } catch (e) {
+    $('status').textContent = 'Erro: ' + e.message + aviso;
+  }
+  $('gerar').disabled = false;
+}
+</script>
+</body>
+</html>
